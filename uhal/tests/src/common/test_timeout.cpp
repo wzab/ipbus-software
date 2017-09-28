@@ -36,6 +36,7 @@
 
 #include "uhal/ProtocolUDP.hpp"
 #include "uhal/ProtocolTCP.hpp"
+#include "uhal/ProtocolPCIe.hpp"
 #include "uhal/ProtocolControlHub.hpp"
 
 #include "uhal/tests/tools.hpp"
@@ -68,6 +69,10 @@ BOOST_FIXTURE_TEST_CASE(check_timeout, TestFixture)
   else if ( hw.uri().find ( "ipbustcp" ) != std::string::npos )
   {
     BOOST_CHECK_THROW ( { hw.getNode ( "REG" ).read();  hw.dispatch(); } , uhal::exception::TcpTimeout );
+  }
+  else if ( hw.uri().find ( "ipbuspcie" ) != std::string::npos )
+  {
+    BOOST_CHECK_THROW ( { hw.getNode ( "REG" ).read();  hw.dispatch(); } , uhal::exception::PCIeTimeout );
   }
   else
   {
