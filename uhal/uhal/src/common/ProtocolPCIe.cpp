@@ -56,12 +56,19 @@ PCIe::PCIe ( const std::string& aId, const URI& aUri ) :
   mDevicePathFPGAToHost(aUri.mHostname.substr(aUri.mHostname.find(",")+1)),
   mDeviceFileHostToFPGA(-1),
   mDeviceFileFPGAToHost(-1),
+  mRaghuInterface(false),
+  mNumberOfStatusWords(4),
   mNumberOfPages(0),
   mPageSize(0),
   mIndexNextPage(0),
   mPublishedReplyPageCount(0),
   mAsynchronousException ( NULL )
 {
+  if (mRaghuInterface) {
+    mNumberOfStatusWords = 0;
+    log( Notice(), "Raghu interface being used for PCIe device with URI ", Quote(uri()));
+  }
+
   if ( aUri.mHostname.find(",") == std::string::npos ) {
     exception::PCIeInitialisationError lExc;
     log(lExc, "No comma found in hostname of PCIe client URI '" + uri() + "'; cannot construct 2 paths for device files");
@@ -101,14 +108,22 @@ void PCIe::connect()
     throw lExc;
   }
 
+  if (mNumberOfStatusWords > 0 ) {
   std::vector<uint32_t> lValues;
-  dmaRead(mDeviceFileFPGAToHost, 0x0, 4, lValues);
+  dmaRead(mDeviceFileFPGAToHost, 0x0, mNumberOfStatusWords, lValues);
 
   mNumberOfPages = lValues.at(0);
   mPageSize = lValues.at(1);
   mIndexNextPage = lValues.at(2);
   mPublishedReplyPageCount = lValues.at(3);
-
+  }
+  else {
+    log ( Info() , "PCIe client for device at ", Quote(mDevicePathHostToFPGA), ", ", Quote(mDevicePathHostToFPGA), " will use HARDCODED max packet size and number of packets in flight" );
+    mNumberOfPages = 1;
+    mPageSize = 1000;
+    mIndexNextPage = 1;
+    mPublishedReplyPageCount = 0;
+  }
   log ( Info() , "PCIe client connected to device at ", Quote(mDevicePathHostToFPGA), ", ", Quote(mDevicePathHostToFPGA), "; FPGA has ", Integer(mNumberOfPages), " pages, each of size ", Integer(mPageSize), " words, index ", Integer(mIndexNextPage), " should be filled next" );
 }
 
@@ -162,10 +177,13 @@ void PCIe::write(const boost::shared_ptr<Buffers>& aBuffers)
 
   // FIXME : Improve by simply adding dmaWrite method that takes const uint32_t ref as argument 
   std::vector<uint32_t> lPreamble;
-  lPreamble.push_back(lNrWordsInPacket);
-  dmaWrite(mDeviceFileHostToFPGA, 4 + mIndexNextPage * mPageSize, lPreamble);
+  if (mRaghuInterface)
+    lPreamble.push_back(0x10000 || (lNrWordsInPacket && 0xFFFF));
+  else
+    lPreamble.push_back(lNrWordsInPacket);
+  dmaWrite(mDeviceFileHostToFPGA, mIndexNextPage * mPageSize, lPreamble);
 
-  dmaWrite(mDeviceFileHostToFPGA, 4 + mIndexNextPage * mPageSize + 1, aBuffers->getSendBuffer(), aBuffers->sendCounter());
+  dmaWrite(mDeviceFileHostToFPGA, mIndexNextPage * mPageSize + 1, aBuffers->getSendBuffer(), aBuffers->sendCounter());
 
   // FIXME: Full packet contents in debug log message?
   // std::cout << "Client sending:" << std::endl;
@@ -183,36 +201,39 @@ void PCIe::write(const boost::shared_ptr<Buffers>& aBuffers)
 void PCIe::read()
 {
   const size_t lPageIndexToRead = (mIndexNextPage - mReplyQueue.size() + mNumberOfPages) % mNumberOfPages;
-  SteadyClock_t::time_point lStartTime = SteadyClock_t::now();
+  if (!mRaghuInterface) {
+    SteadyClock_t::time_point lStartTime = SteadyClock_t::now();
 
-  uint32_t lHwPublishedPageCount = 0x0;
-  while ( true ) {
-    std::vector<uint32_t> lValues;
-    // FIXME : Improve by simply adding dmaWrite method that takes uint32_t ref as argument (or returns uint32_t)
-    dmaRead(mDeviceFileFPGAToHost, 3, 1, lValues);
-    lHwPublishedPageCount = lValues.at(0);
+    uint32_t lHwPublishedPageCount = 0x0;
+    while ( true ) {
+      std::vector<uint32_t> lValues;
+      // FIXME : Improve by simply adding dmaWrite method that takes uint32_t ref as argument (or returns uint32_t)
+      dmaRead(mDeviceFileFPGAToHost, 3, 1, lValues);
+      lHwPublishedPageCount = lValues.at(0);
 
-    if (lHwPublishedPageCount != mPublishedReplyPageCount) {
-      mPublishedReplyPageCount++;
-      break;
+      if (lHwPublishedPageCount != mPublishedReplyPageCount) {
+        mPublishedReplyPageCount++;
+        break;
+      }
+      // FIXME: Throw if published page count is invalid number
+
+      if (SteadyClock_t::now() - lStartTime > boost::chrono::microseconds(getBoostTimeoutPeriod().total_microseconds())) {
+        exception::PCIeTimeout lExc;
+        log(lExc, "Next page (index ", Integer(lPageIndexToRead), "count ", Integer(mPublishedReplyPageCount+1), ") of PCIe device '" + mDevicePathHostToFPGA + "' is not ready after timeout period");
+        throw lExc;
+      }
+
+      log(Debug(), "PCIe client ", Quote(id()), " (URI: ", Quote(uri()), ") : Trying to read page index ", Integer(lPageIndexToRead), " = count ", Integer(mPublishedReplyPageCount+1), "; published page count is ", Integer(lHwPublishedPageCount), "; sleeping for a while ...");
+      boost::this_thread::sleep_for( boost::chrono::microseconds(50));
     }
-    // FIXME: Throw if published page count is invalid number
-
-    if (SteadyClock_t::now() - lStartTime > boost::chrono::microseconds(getBoostTimeoutPeriod().total_microseconds())) {
-      exception::PCIeTimeout lExc;
-      log(lExc, "Next page (index ", Integer(lPageIndexToRead), "count ", Integer(mPublishedReplyPageCount+1), ") of PCIe device '" + mDevicePathHostToFPGA + "' is not ready after timeout period");
-      throw lExc;
-    }
-
-    log(Debug(), "PCIe client ", Quote(id()), " (URI: ", Quote(uri()), ") : Trying to read page index ", Integer(lPageIndexToRead), " = count ", Integer(mPublishedReplyPageCount+1), "; published page count is ", Integer(lHwPublishedPageCount), "; sleeping for a while ...");
-    boost::this_thread::sleep_for( boost::chrono::microseconds(50));
+    log(Info(), "PCIe client ", Quote(id()), " (URI: ", Quote(uri()), ") : Reading page ", Integer(lPageIndexToRead), " (published count ", Integer(lHwPublishedPageCount), ", surpasses required, ", Integer(mPublishedReplyPageCount), ")");
   }
-
-  log(Info(), "PCIe client ", Quote(id()), " (URI: ", Quote(uri()), ") : Reading page ", Integer(lPageIndexToRead), " (published count ", Integer(lHwPublishedPageCount), ", surpasses required, ", Integer(mPublishedReplyPageCount), ")");
+  else
+    log(Info(), "PCIe client ", Quote(id()), " (URI: ", Quote(uri()), ") : Reading page ", Integer(lPageIndexToRead));
 
   // PART 1 : Read the page
   std::vector<uint32_t> lPageContents;
-  dmaRead(mDeviceFileFPGAToHost, 4 + lPageIndexToRead * 4 * mPageSize, mPageSize, lPageContents);
+  dmaRead(mDeviceFileFPGAToHost, mNumberOfStatusWords + lPageIndexToRead * 4 * mPageSize, mPageSize, lPageContents);
 
   // PART 2 : Transfer to reply buffer
   boost::shared_ptr<Buffers> lBuffers = mReplyQueue.front();

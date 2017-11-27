@@ -151,6 +151,9 @@ namespace uhal
       int mDeviceFileFPGAToHost;
 
 
+      size_t mRaghuInterface;
+      size_t mNumberOfStatusWords;
+
       uint32_t mNumberOfPages, mPageSize, mIndexNextPage, mPublishedReplyPageCount;
 
       //! The list of buffers still awaiting a reply
